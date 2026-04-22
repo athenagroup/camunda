@@ -384,5 +384,327 @@
         </plugins>
       </build>
     </profile>
+
+    <!--
+      shade-netty:
+        Builds camunda-client-java with Netty (and grpc-netty) repackaged into an internal
+        "io.camunda.client.shaded" namespace, then installs/deploys the result under the same
+        groupId:artifactId but at a custom version.
+
+        Why the two-step install-file/deploy-file dance?
+          Internal Camunda deps (zeebe-bpmn-model, zeebe-gateway-protocol-impl, zeebe-protocol)
+          are declared in the parent pom with <version>${project.version}</version>. Changing
+          camunda-client-java's project.version would therefore make those deps unresolvable.
+          Instead, the build keeps project.version at the checked-out tag version, produces
+          the shaded jar, and then re-publishes it under -Dshaded.deploy.version=... by running
+          install-file / deploy-file against a rewritten copy of dependency-reduced-pom.xml.
+
+        Usage:
+          # Install locally:
+          ./mvnw -pl clients/java -am -Dquickly \
+            -Pshade-netty \
+            -Dshaded.deploy.version=8.9.0-netty42.1 \
+            install
+
+          # Deploy to your own repo (server id must exist in ~/.m2/settings.xml):
+          ./mvnw -pl clients/java -am -Dquickly \
+            -Pshade-netty \
+            -Dshaded.deploy.version=8.9.0-netty42.1 \
+            -Dshaded.deploy.repositoryId=internal-releases \
+            -Dshaded.deploy.url=https://maven.example.com/repository/releases/ \
+            deploy
+
+        See README-shaded-netty.md for the full walkthrough.
+    -->
+    <profile>
+      <id>shade-netty</id>
+
+      <properties>
+        <!-- Namespace under which relocated classes live. Override if you want a different root. -->
+        <shaded.netty.prefix>io.camunda.client.shaded</shaded.netty.prefix>
+
+        <!-- Coordinates used by install-file / deploy-file. By default these match the
+             reactor (so the shaded build just replaces the regular install / deploy output);
+             override via -D to publish under a distinct version. -->
+        <shaded.deploy.version>${project.version}</shaded.deploy.version>
+        <shaded.deploy.repositoryId>internal-releases</shaded.deploy.repositoryId>
+        <shaded.deploy.url>https://maven.example.com/repository/releases/</shaded.deploy.url>
+      </properties>
+
+      <dependencies>
+        <!--
+          grpc-netty references com.google.common.base.Supplier (and a handful of other
+          Guava types) from its static initializers, e.g. io.grpc.netty.Utils. In the
+          unshaded build, Guava reaches downstream consumers through grpc-netty's own pom
+          transitive; once grpc-netty is shaded INTO this jar, that transitive disappears
+          from the dependency-reduced-pom, and the other grpc-* modules in the Camunda
+          parent's dependency management explicitly <exclusion>Guava. Re-declare Guava here
+          at runtime scope so the reduced pom promotes it and consumers still pick it up.
+        -->
+        <dependency>
+          <groupId>com.google.guava</groupId>
+          <artifactId>guava</artifactId>
+          <scope>runtime</scope>
+        </dependency>
+      </dependencies>
+
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-shade-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>shade-netty</id>
+                <phase>package</phase>
+                <goals>
+                  <goal>shade</goal>
+                </goals>
+                <configuration>
+                  <!-- Regenerate a pom with netty / grpc-netty removed from the deps list,
+                       since they are now vendored into the jar itself. -->
+                  <createDependencyReducedPom>true</createDependencyReducedPom>
+                  <promoteTransitiveDependencies>true</promoteTransitiveDependencies>
+                  <!-- Replace the main jar with the shaded one (same g:a, new version). -->
+                  <shadedArtifactAttached>false</shadedArtifactAttached>
+                  <!-- createSourcesJar would produce a relocated sources jar, but we can't
+                       deploy it cleanly: deploy-file, when bound inside a project build,
+                       always ALSO deploys the project's attached artifacts, and those are
+                       pinned to project.version (8.9.0), not shaded.deploy.version. The
+                       resulting mixed-version upload is rejected by strict repos. Skip the
+                       shaded sources jar; consumers who want sources can pull them from the
+                       non-shaded upstream release at io.camunda:camunda-client-java:8.9.0. -->
+                  <createSourcesJar>false</createSourcesJar>
+                  <minimizeJar>false</minimizeJar>
+
+                  <artifactSet>
+                    <includes>
+                      <include>io.netty:*</include>
+                      <!-- grpc-netty is the only grpc module that references io.netty.*, so it
+                           must be relocated together with netty. Other grpc-* modules are left
+                           as normal transitive deps. -->
+                      <include>io.grpc:grpc-netty</include>
+                    </includes>
+                    <excludes>
+                      <!-- tcnative registers JNI methods by FQCN via RegisterNatives; renaming
+                           its classes breaks native binding. Keep it as an external runtime dep
+                           at its original coordinates. -->
+                      <exclude>io.netty:netty-tcnative</exclude>
+                      <exclude>io.netty:netty-tcnative-classes</exclude>
+                      <exclude>io.netty:netty-tcnative-boringssl-static</exclude>
+                    </excludes>
+                  </artifactSet>
+
+                  <relocations>
+                    <relocation>
+                      <pattern>io.netty</pattern>
+                      <shadedPattern>${shaded.netty.prefix}.io.netty</shadedPattern>
+                      <excludes>
+                        <!-- Leave references to tcnative untouched (see artifactSet comment). -->
+                        <exclude>io.netty.internal.tcnative.**</exclude>
+                      </excludes>
+                    </relocation>
+                    <relocation>
+                      <pattern>io.grpc.netty</pattern>
+                      <shadedPattern>${shaded.netty.prefix}.io.grpc.netty</shadedPattern>
+                    </relocation>
+                  </relocations>
+
+                  <transformers>
+                    <!-- Merge META-INF/services entries from the shaded artifacts, e.g.
+                         io.grpc.ManagedChannelProvider, so that the NettyChannelProvider is
+                         discovered under its relocated name. -->
+                    <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                    <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer"/>
+                    <!-- Preserve the license / notice files from bundled netty jars. -->
+                    <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer"/>
+                    <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer"/>
+                  </transformers>
+
+                  <filters>
+                    <filter>
+                      <artifact>io.netty:*</artifact>
+                      <excludes>
+                        <exclude>META-INF/MANIFEST.MF</exclude>
+                        <exclude>META-INF/io.netty.versions.properties</exclude>
+                        <!-- Native-image / GraalVM config references the original io.netty
+                             package names; keeping them in would misguide GraalVM builds. -->
+                        <exclude>META-INF/native-image/**</exclude>
+                        <!-- Signatures become invalid after bytecode rewrite. -->
+                        <exclude>META-INF/*.SF</exclude>
+                        <exclude>META-INF/*.DSA</exclude>
+                        <exclude>META-INF/*.RSA</exclude>
+                        <exclude>module-info.class</exclude>
+                      </excludes>
+                    </filter>
+                    <filter>
+                      <artifact>io.grpc:grpc-netty</artifact>
+                      <excludes>
+                        <exclude>META-INF/MANIFEST.MF</exclude>
+                        <exclude>module-info.class</exclude>
+                      </excludes>
+                    </filter>
+                  </filters>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- The shaded jar uses relocated classes that no longer match the declared deps.
+               Relax the strict "used but undeclared" check for this build only. -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-dependency-plugin</artifactId>
+            <configuration>
+              <failOnWarning>false</failOnWarning>
+            </configuration>
+          </plugin>
+
+          <!-- revapi compares against previously released non-shaded artifacts and will flag
+               every relocated package as a break. Skip it in this profile. -->
+          <plugin>
+            <groupId>org.revapi</groupId>
+            <artifactId>revapi-maven-plugin</artifactId>
+            <configuration>
+              <skip>true</skip>
+            </configuration>
+          </plugin>
+
+          <!-- Post-process the shade plugin's dependency-reduced-pom.xml into a pom suitable
+               for install-file / deploy-file: rewrite the project version to
+               ${shaded.deploy.version} while leaving all dep versions alone. -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-antrun-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>rewrite-shaded-deploy-pom</id>
+                <phase>package</phase>
+                <goals>
+                  <goal>run</goal>
+                </goals>
+                <configuration>
+                  <target>
+                    <copy file="${project.basedir}/dependency-reduced-pom.xml"
+                          tofile="${project.build.directory}/shaded-deploy-pom.xml"
+                          overwrite="true"/>
+                    <!-- The dep-reduced pom omits an explicit <version> on the child project
+                         (it's inherited from <parent>). install-file / deploy-file read
+                         coordinates from the pom, so we inject a <version> element right after
+                         the project's own <artifactId>. Safe because that exact artifactId
+                         appears only once in the reduced pom. -->
+                    <replaceregexp
+                        file="${project.build.directory}/shaded-deploy-pom.xml"
+                        match="(&lt;artifactId&gt;camunda-client-java&lt;/artifactId&gt;)"
+                        replace="\1&lt;version&gt;${shaded.deploy.version}&lt;/version&gt;"/>
+                  </target>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Suppress the default install and replace it with an install-file that uses the
+               rewritten pom + the shaded jar. The coordinates published to the local repo are
+               io.camunda:camunda-client-java:${shaded.deploy.version}. -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-install-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>default-install</id>
+                <phase>none</phase>
+              </execution>
+              <execution>
+                <id>install-shaded</id>
+                <phase>install</phase>
+                <goals>
+                  <goal>install-file</goal>
+                </goals>
+                <configuration>
+                  <file>${project.build.directory}/${project.build.finalName}.jar</file>
+                  <pomFile>${project.build.directory}/shaded-deploy-pom.xml</pomFile>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Disable maven-source-plugin's attach-sources so it doesn't add a sources
+               artifact at project.version (8.9.0). If it stayed attached, deploy-file would
+               publish it alongside the shaded main jar, producing a version-mismatched
+               sources upload (8.9.0) next to the correctly-versioned main (8.9.0-netty42.1). -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <phase>none</phase>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Same pattern for deploy: skip default-deploy, run deploy-file against the
+               rewritten pom. The target repo is controlled entirely by command-line / property
+               overrides so the profile does not hard-code any URL. -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-deploy-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>default-deploy</id>
+                <phase>none</phase>
+              </execution>
+              <execution>
+                <id>deploy-shaded</id>
+                <phase>deploy</phase>
+                <goals>
+                  <goal>deploy-file</goal>
+                </goals>
+                <configuration>
+                  <file>${project.build.directory}/${project.build.finalName}.jar</file>
+                  <pomFile>${project.build.directory}/shaded-deploy-pom.xml</pomFile>
+                  <!-- Override these on the command line. The repositoryId must match a
+                       <server> entry in ~/.m2/settings.xml so credentials are picked up. -->
+                  <repositoryId>${shaded.deploy.repositoryId}</repositoryId>
+                  <url>${shaded.deploy.url}</url>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- nexus-staging-maven-plugin is declared with <extensions>true</extensions> in
+               bom/pom.xml, which injects a "default-deploy" execution bound to the deploy
+               phase. That execution would otherwise try to stage artifacts to Camunda's
+               upstream artifacts.camunda.com. Rebind it to phase "none" so only our
+               deploy-file execution runs for this module.
+
+               Note: upstream modules (zeebe-gateway-protocol, zeebe-bpmn-model, etc.) do NOT
+               activate this profile, so they still have nexus-staging active. The recommended
+               flow is to run `install -am` first (populates local repo, never touches deploy
+               phase) and then `deploy -pl clients/java` without -am (so only this module's
+               deploy phase fires). See README-shaded-netty.md. -->
+          <plugin>
+            <groupId>org.sonatype.plugins</groupId>
+            <artifactId>nexus-staging-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>default-deploy</id>
+                <phase>none</phase>
+              </execution>
+              <execution>
+                <id>injected-nexus-deploy</id>
+                <phase>none</phase>
+              </execution>
+            </executions>
+            <configuration>
+              <skipNexusStagingDeployMojo>true</skipNexusStagingDeployMojo>
+              <skipStaging>true</skipStaging>
+              <skipLocalStaging>true</skipLocalStaging>
+              <skipRemoteStaging>true</skipRemoteStaging>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
   </profiles>
 </project>
